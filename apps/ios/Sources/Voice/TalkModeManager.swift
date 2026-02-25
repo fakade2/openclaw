@@ -199,7 +199,7 @@ final class TalkModeManager: NSObject {
         self.silenceTask?.cancel()
         self.silenceTask = nil
         self.stopRecognition()
-        self.stopSpeaking()
+        self.stopSpeaking(reason: "mode-stop")
         self.lastInterruptedAtSeconds = nil
         let pendingPTT = self.pttCompletion != nil
         let pendingCaptureId = self.activePTTCaptureId ?? UUID().uuidString
@@ -244,7 +244,7 @@ final class TalkModeManager: NSObject {
         self.silenceTask = nil
 
         self.stopRecognition()
-        self.stopSpeaking()
+        self.stopSpeaking(reason: "background-suspend")
         self.lastInterruptedAtSeconds = nil
         TalkSystemSpeechSynthesizer.shared.stop()
 
@@ -266,7 +266,7 @@ final class TalkModeManager: NSObject {
     }
 
     func userTappedOrb() {
-        self.stopSpeaking()
+        self.stopSpeaking(reason: "user-orb-tap")
     }
 
     func beginPushToTalk() async throws -> OpenClawTalkPTTStartPayload {
@@ -280,7 +280,7 @@ final class TalkModeManager: NSObject {
             return OpenClawTalkPTTStartPayload(captureId: captureId)
         }
 
-        self.stopSpeaking(storeInterruption: false)
+        self.stopSpeaking(storeInterruption: false, reason: "ptt-begin")
         self.pttTimeoutTask?.cancel()
         self.pttTimeoutTask = nil
         self.pttAutoStopEnabled = false
@@ -653,7 +653,7 @@ final class TalkModeManager: NSObject {
         let ttsActive = self.isSpeechOutputActive
         if ttsActive, self.interruptOnSpeech {
             if self.shouldInterrupt(with: trimmed) {
-                self.stopSpeaking()
+                self.stopSpeaking(reason: "speech-interrupt")
             }
             return
         }
@@ -773,7 +773,15 @@ final class TalkModeManager: NSObject {
                     await self.streamAssistant(runId: runId, gateway: gateway)
                 }
             }
-            let completion = await self.waitForChatCompletion(runId: runId, gateway: gateway, timeoutSeconds: 120)
+            let completionStartedAt = Date()
+            let completionResult = await self.waitForChatCompletion(
+                runId: runId,
+                gateway: gateway,
+                timeoutSeconds: 120)
+            let completion = completionResult.state
+            let completionWaitMs = Int(Date().timeIntervalSince(completionStartedAt) * 1000)
+            GatewayDiagnostics.log(
+                "talk: chat completion state runId=\(runId) state=\(completion) waitMs=\(completionWaitMs)")
             if completion == .timeout {
                 self.logger.warning(
                     "chat completion timeout runId=\(runId, privacy: .public); attempting history fallback")
@@ -796,13 +804,38 @@ final class TalkModeManager: NSObject {
                 return
             }
 
-            var assistantText = try await self.waitForAssistantText(
-                gateway: gateway,
-                since: startedAt,
-                timeoutSeconds: completion == .final ? 12 : 25)
-            if assistantText == nil, shouldIncremental {
+            let eventAssistantText = completionResult.finalAssistantText?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var assistantText: String?
+            if let eventAssistantText, !eventAssistantText.isEmpty {
+                GatewayDiagnostics.log(
+                    "talk: assistant text from chat event runId=\(runId) chars=\(eventAssistantText.count)")
+                assistantText = eventAssistantText
+            }
+
+            if assistantText == nil {
+                // History can surface transient assistant/tool scaffolding before the final
+                // assistant message is committed. Require a short stability window.
+                let requireStableAssistantText = true
+                assistantText = try await self.waitForAssistantText(
+                    gateway: gateway,
+                    since: startedAt,
+                    timeoutSeconds: completion == .final ? 12 : 25,
+                    runId: runId,
+                    requireStability: requireStableAssistantText)
+            }
+            if shouldIncremental {
                 let fallback = self.incrementalSpeechBuffer.latestText
-                if !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let resolved = assistantText?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    // When completion events are flaky we can see a stale/partial
+                    // history entry first. Prefer a meaningfully longer streamed text.
+                    if fallback.count >= resolved.count + 12 {
+                        GatewayDiagnostics.log(
+                            "talk: assistant text replaced from stream historyChars=\(resolved.count) streamChars=\(fallback.count)")
+                        assistantText = fallback
+                    }
+                } else if !fallback.isEmpty {
                     assistantText = fallback
                 }
             }
@@ -873,6 +906,11 @@ final class TalkModeManager: NSObject {
         }
     }
 
+    private struct ChatCompletionResult {
+        let state: ChatCompletionState
+        let finalAssistantText: String?
+    }
+
     private func sendChat(_ message: String, gateway: GatewayNodeSession) async throws -> String {
         struct SendResponse: Decodable { let runId: String }
         let payload: [String: Any] = [
@@ -897,13 +935,13 @@ final class TalkModeManager: NSObject {
     private func waitForChatCompletion(
         runId: String,
         gateway: GatewayNodeSession,
-        timeoutSeconds: Int = 120) async -> ChatCompletionState
+        timeoutSeconds: Int = 120) async -> ChatCompletionResult
     {
         let stream = await gateway.subscribeServerEvents(bufferingNewest: 200)
-        return await withTaskGroup(of: ChatCompletionState.self) { group in
+        return await withTaskGroup(of: ChatCompletionResult.self) { group in
             group.addTask { [runId] in
                 for await evt in stream {
-                    if Task.isCancelled { return .timeout }
+                    if Task.isCancelled { return ChatCompletionResult(state: .timeout, finalAssistantText: nil) }
                     guard evt.event == "chat", let payload = evt.payload else { continue }
                     guard let chatEvent = try? GatewayPayloadDecoding.decode(payload, as: ChatEvent.self) else {
                         continue
@@ -911,41 +949,100 @@ final class TalkModeManager: NSObject {
                     guard chatEvent.runid == runId else { continue }
                     if let state = chatEvent.state.value as? String {
                         switch state {
-                        case "final": return .final
-                        case "aborted": return .aborted
-                        case "error": return .error
+                        case "final":
+                            let eventText = Self.extractAssistantText(fromChatEventMessage: chatEvent.message)
+                            return ChatCompletionResult(state: .final, finalAssistantText: eventText)
+                        case "aborted":
+                            return ChatCompletionResult(state: .aborted, finalAssistantText: nil)
+                        case "error":
+                            return ChatCompletionResult(state: .error, finalAssistantText: nil)
                         default: break
                         }
                     }
                 }
-                return .timeout
+                GatewayDiagnostics.log("talk: chat event stream ended runId=\(runId)")
+                return ChatCompletionResult(state: .timeout, finalAssistantText: nil)
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
-                return .timeout
+                return ChatCompletionResult(state: .timeout, finalAssistantText: nil)
             }
-            let result = await group.next() ?? .timeout
+            let result = await group.next() ?? ChatCompletionResult(state: .timeout, finalAssistantText: nil)
             group.cancelAll()
             return result
         }
     }
 
+    private struct AssistantHistoryMessage {
+        let text: String
+        let timestamp: Double?
+        let source: String
+    }
+
     private func waitForAssistantText(
         gateway: GatewayNodeSession,
         since: Double,
-        timeoutSeconds: Int) async throws -> String?
+        timeoutSeconds: Int,
+        runId: String,
+        requireStability: Bool = false) async throws -> String?
     {
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
+        var candidate: String?
+        var candidateSince: Date?
+        let stableWindow: TimeInterval = 0.9
+        var poll = 0
+        GatewayDiagnostics.log(
+            "talk: assistant wait start runId=\(runId) timeout=\(timeoutSeconds)s stable=\(requireStability)")
+
         while Date() < deadline {
-            if let text = try await self.fetchLatestAssistantText(gateway: gateway, since: since) {
-                return text
+            poll += 1
+            if let message = try await self.fetchLatestAssistantText(
+                gateway: gateway,
+                since: since,
+                runId: runId)
+            {
+                let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+                let ts = Self.describeHistoryTimestamp(message.timestamp)
+                if !requireStability {
+                    GatewayDiagnostics.log(
+                        "talk: assistant wait return runId=\(runId) poll=\(poll) chars=\(trimmed.count) ts=\(ts) source=\(message.source)")
+                    return trimmed
+                }
+                if candidate != trimmed {
+                    candidate = trimmed
+                    candidateSince = Date()
+                    GatewayDiagnostics.log(
+                        "talk: assistant wait candidate runId=\(runId) poll=\(poll) chars=\(trimmed.count) ts=\(ts) source=\(message.source) preview=\"\(Self.previewForLogs(trimmed))\"")
+                } else if let candidateSince,
+                          Date().timeIntervalSince(candidateSince) >= stableWindow
+                {
+                    let stableMs = Int(Date().timeIntervalSince(candidateSince) * 1000)
+                    GatewayDiagnostics.log(
+                        "talk: assistant wait stable runId=\(runId) poll=\(poll) chars=\(trimmed.count) stableMs=\(stableMs)")
+                    return trimmed
+                }
             }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
-        return nil
+        if let candidate {
+            GatewayDiagnostics.log(
+                "talk: assistant wait timeout runId=\(runId) polls=\(poll) returningCandidate chars=\(candidate.count)")
+        } else {
+            GatewayDiagnostics.log("talk: assistant wait timeout runId=\(runId) polls=\(poll) noCandidate")
+        }
+        return candidate
     }
 
-    private func fetchLatestAssistantText(gateway: GatewayNodeSession, since: Double? = nil) async throws -> String? {
+    private func fetchLatestAssistantText(
+        gateway: GatewayNodeSession,
+        since: Double? = nil,
+        runId: String? = nil
+    ) async throws -> AssistantHistoryMessage?
+    {
         let res = try await gateway.request(
             method: "chat.history",
             paramsJSON: "{\"sessionKey\":\"\(self.mainSessionKey)\"}",
@@ -954,17 +1051,171 @@ final class TalkModeManager: NSObject {
         guard let messages = json["messages"] as? [[String: Any]] else { return nil }
         for msg in messages.reversed() {
             guard (msg["role"] as? String) == "assistant" else { continue }
-            if let since, let timestamp = msg["timestamp"] as? Double,
-               TalkHistoryTimestamp.isAfter(timestamp, sinceSeconds: since) == false
-            {
+            let timestamp = Self.parseHistoryTimestamp(msg["timestamp"])
+            if Self.isToolCarrierAssistantMessage(msg) {
+                if let ttsText = Self.extractAssistantTTSToolCallText(fromHistoryAssistantMessage: msg) {
+                    return AssistantHistoryMessage(text: ttsText, timestamp: timestamp, source: "history:tts-tool-call")
+                }
                 continue
             }
-            guard let content = msg["content"] as? [[String: Any]] else { continue }
-            let text = content.compactMap { $0["text"] as? String }.joined(separator: "\n")
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
+            if let runId {
+                let messageRunId = Self.extractHistoryRunId(msg)
+                if let messageRunId, !messageRunId.isEmpty, messageRunId != runId {
+                    continue
+                }
+            }
+            if let since {
+                guard let timestamp else { continue }
+                if TalkHistoryTimestamp.isAfter(timestamp, sinceSeconds: since) == false {
+                    continue
+                }
+            }
+            if let assistantText = Self.extractAssistantSpokenText(fromHistoryAssistantMessage: msg) {
+                return AssistantHistoryMessage(text: assistantText, timestamp: timestamp, source: "history:assistant-text")
+            }
+            if let ttsText = Self.extractAssistantTTSToolCallText(fromHistoryAssistantMessage: msg) {
+                return AssistantHistoryMessage(text: ttsText, timestamp: timestamp, source: "history:tts-tool-call")
+            }
         }
         return nil
+    }
+
+    private nonisolated static func extractAssistantText(fromChatEventMessage payload: AnyCodable?) -> String? {
+        guard let payload else { return nil }
+
+        if let decoded = try? GatewayPayloadDecoding.decode(payload, as: OpenClawChatMessage.self),
+           decoded.role == "assistant"
+        {
+            let text = decoded.content.compactMap(\.text).joined(separator: "\n")
+            if let normalized = Self.normalizedSpokenAssistantText(text) {
+                return normalized
+            }
+        }
+
+        guard let raw = payload.value as? [String: Any] else { return nil }
+        guard (raw["role"] as? String) == "assistant" else { return nil }
+
+        if let normalized = Self.extractAssistantSpokenText(fromHistoryAssistantMessage: raw) {
+            return normalized
+        }
+
+        if let ttsText = Self.extractAssistantTTSToolCallText(fromHistoryAssistantMessage: raw) {
+            return ttsText
+        }
+
+        return nil
+    }
+
+    private static func isToolCarrierAssistantMessage(_ msg: [String: Any]) -> Bool {
+        if msg["toolCallId"] != nil || msg["tool_call_id"] != nil {
+            return true
+        }
+        if msg["toolName"] != nil || msg["tool_name"] != nil {
+            return true
+        }
+        return false
+    }
+
+    private static func extractHistoryRunId(_ msg: [String: Any]) -> String? {
+        if let runId = msg["runId"] as? String {
+            return runId
+        }
+        if let runId = msg["runid"] as? String {
+            return runId
+        }
+        if let abort = msg["openclawAbort"] as? [String: Any], let runId = abort["runId"] as? String {
+            return runId
+        }
+        return nil
+    }
+
+    private static func parseHistoryTimestamp(_ raw: Any?) -> Double? {
+        if let value = raw as? Double { return value }
+        if let value = raw as? Int { return Double(value) }
+        if let value = raw as? Int64 { return Double(value) }
+        if let value = raw as? NSNumber { return value.doubleValue }
+        if let value = raw as? String, let parsed = Double(value) { return parsed }
+        return nil
+    }
+
+    private static func describeHistoryTimestamp(_ timestamp: Double?) -> String {
+        guard let timestamp else { return "missing" }
+        return String(format: "%.3f", timestamp)
+    }
+
+    private nonisolated static func normalizedSpokenAssistantText(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.uppercased() == "NO_REPLY" {
+            return nil
+        }
+        return trimmed
+    }
+
+    private nonisolated static func extractAssistantSpokenText(fromHistoryAssistantMessage msg: [String: Any]) -> String? {
+        if let content = msg["content"] as? [[String: Any]] {
+            let text = content.compactMap { block -> String? in
+                if let type = (block["type"] as? String)?.lowercased(),
+                   type != "text",
+                   type != "output_text",
+                   type != "input_text"
+                {
+                    return nil
+                }
+                return block["text"] as? String
+            }.joined(separator: "\n")
+            if let normalized = Self.normalizedSpokenAssistantText(text) {
+                return normalized
+            }
+        }
+
+        if let content = msg["content"] as? String,
+           let normalized = Self.normalizedSpokenAssistantText(content)
+        {
+            return normalized
+        }
+
+        if let text = msg["text"] as? String,
+           let normalized = Self.normalizedSpokenAssistantText(text)
+        {
+            return normalized
+        }
+
+        return nil
+    }
+
+    private nonisolated static func extractAssistantTTSToolCallText(fromHistoryAssistantMessage msg: [String: Any]) -> String? {
+        guard let content = msg["content"] as? [[String: Any]] else { return nil }
+        for block in content {
+            let type = (block["type"] as? String)?.lowercased() ?? ""
+            guard type == "toolcall" || type == "tool_call" else { continue }
+            let name = (block["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            guard name == "tts" else { continue }
+
+            if let args = block["arguments"] as? [String: Any],
+               let text = args["text"] as? String,
+               let normalized = Self.normalizedSpokenAssistantText(text)
+            {
+                return normalized
+            }
+
+            if let args = block["arguments"] as? String,
+               let argsData = args.data(using: .utf8),
+               let json = (try? JSONSerialization.jsonObject(with: argsData)) as? [String: Any],
+               let text = json["text"] as? String,
+               let normalized = Self.normalizedSpokenAssistantText(text)
+            {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private static func previewForLogs(_ text: String, limit: Int = 28) -> String {
+        let compact = text.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
+        if compact.count <= limit { return compact }
+        return "\(compact.prefix(limit))…"
     }
 
     private func playAssistant(text: String) async {
@@ -973,6 +1224,7 @@ final class TalkModeManager: NSObject {
         let cleaned = parsed.stripped.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         self.applyDirective(directive)
+        GatewayDiagnostics.log("talk tts: request chars=\(cleaned.count) mode=single")
 
         self.statusText = "Generating voice…"
         self.isSpeaking = true
@@ -1066,6 +1318,10 @@ final class TalkModeManager: NSObject {
                 }
                 let duration = Date().timeIntervalSince(started)
                 self.logger.info("elevenlabs stream finished=\(result.finished, privacy: .public) dur=\(duration, privacy: .public)s")
+                let interruptedAt = result.interruptedAt.map { String(format: "%.3f", $0) } ?? "none"
+                let durationMs = Int(duration * 1000)
+                GatewayDiagnostics.log(
+                    "talk tts: playback finished=\(result.finished) interruptedAt=\(interruptedAt) durMs=\(durationMs) pcm=\(self.lastPlaybackWasPCM)")
                 if !result.finished, let interruptedAt = result.interruptedAt {
                     self.lastInterruptedAtSeconds = interruptedAt
                 }
@@ -1081,6 +1337,7 @@ final class TalkModeManager: NSObject {
                     }
                 }
                 self.statusText = "Speaking (System)…"
+                GatewayDiagnostics.log("talk tts: system playback start chars=\(cleaned.count)")
                 try await TalkSystemSpeechSynthesizer.shared.speak(text: cleaned, language: language)
             }
         } catch {
@@ -1098,6 +1355,7 @@ final class TalkModeManager: NSObject {
                 }
                 self.statusText = "Speaking (System)…"
                 let language = ElevenLabsTTSClient.validatedLanguage(directive?.language)
+                GatewayDiagnostics.log("talk tts: system playback fallback chars=\(cleaned.count)")
                 try await TalkSystemSpeechSynthesizer.shared.speak(text: cleaned, language: language)
             } catch {
                 self.statusText = "Speak failed: \(error.localizedDescription)"
@@ -1109,7 +1367,7 @@ final class TalkModeManager: NSObject {
         self.isSpeaking = false
     }
 
-    private func stopSpeaking(storeInterruption: Bool = true) {
+    private func stopSpeaking(storeInterruption: Bool = true, reason: String = "unspecified") {
         let hasIncremental = self.incrementalSpeechActive ||
             self.incrementalSpeechTask != nil ||
             !self.incrementalSpeechQueue.isEmpty
@@ -1123,8 +1381,13 @@ final class TalkModeManager: NSObject {
             _ = self.lastPlaybackWasPCM
                 ? self.mp3Player.stop()
                 : self.pcmPlayer.stop()
+            let interruptedSummary = interruptedAt.map { String(format: "%.3f", $0) } ?? "none"
+            GatewayDiagnostics.log(
+                "talk tts: stop reason=\(reason) interruptedAt=\(interruptedSummary) storeInterruption=\(storeInterruption) incrementalActive=\(hasIncremental)")
         } else if !hasIncremental {
             return
+        } else {
+            GatewayDiagnostics.log("talk tts: stop reason=\(reason) incrementalOnly=true")
         }
         TalkSystemSpeechSynthesizer.shared.stop()
         self.cancelIncrementalSpeech()
@@ -1408,6 +1671,8 @@ final class TalkModeManager: NSObject {
     private func handleIncrementalAssistantFinal(text: String) async {
         let parsed = TalkDirectiveParser.parse(text)
         self.applyDirective(parsed.directive)
+        GatewayDiagnostics.log(
+            "talk: assistant final chars=\(text.trimmingCharacters(in: .whitespacesAndNewlines).count) incrementalUsed=\(self.incrementalSpeechUsed)")
         if let lang = parsed.directive?.language {
             self.incrementalSpeechLanguage = ElevenLabsTTSClient.validatedLanguage(lang)
         }
@@ -1424,6 +1689,7 @@ final class TalkModeManager: NSObject {
 
     private func streamAssistant(runId: String, gateway: GatewayNodeSession) async {
         let stream = await gateway.subscribeServerEvents(bufferingNewest: 200)
+        var loggedFirstChunk = false
         for await evt in stream {
             if Task.isCancelled { return }
             guard evt.event == "agent", let payload = evt.payload else { continue }
@@ -1432,6 +1698,11 @@ final class TalkModeManager: NSObject {
             }
             guard agentEvent.runId == runId, agentEvent.stream == "assistant" else { continue }
             guard let text = agentEvent.data["text"]?.value as? String else { continue }
+            if !loggedFirstChunk {
+                loggedFirstChunk = true
+                GatewayDiagnostics.log(
+                    "talk: assistant stream firstChunk runId=\(runId) chars=\(text.trimmingCharacters(in: .whitespacesAndNewlines).count)")
+            }
             let segments = self.incrementalSpeechBuffer.ingest(text: text, isFinal: false)
             if let lang = self.incrementalSpeechBuffer.directive?.language {
                 self.incrementalSpeechLanguage = ElevenLabsTTSClient.validatedLanguage(lang)
@@ -1546,6 +1817,7 @@ final class TalkModeManager: NSObject {
         } else {
             await self.updateIncrementalContextIfNeeded()
             guard let resolvedContext = self.incrementalSpeechContext else {
+                GatewayDiagnostics.log("talk tts: incremental provider=system reason=context-missing chars=\(text.count)")
                 try? await TalkSystemSpeechSynthesizer.shared.speak(
                     text: text,
                     language: self.incrementalSpeechLanguage)
@@ -1555,6 +1827,7 @@ final class TalkModeManager: NSObject {
         }
 
         guard context.canUseElevenLabs, let apiKey = context.apiKey, let voiceId = context.voiceId else {
+            GatewayDiagnostics.log("talk tts: incremental provider=system reason=credentials-missing chars=\(text.count)")
             try? await TalkSystemSpeechSynthesizer.shared.speak(
                 text: text,
                 language: self.incrementalSpeechLanguage)
@@ -1572,6 +1845,8 @@ final class TalkModeManager: NSObject {
         } else {
             stream = client.streamSynthesize(voiceId: voiceId, request: request)
         }
+        GatewayDiagnostics.log(
+            "talk tts: incremental segment chars=\(text.count) prefetched=\(prefetchedAudio != nil)")
         let playbackFormat = prefetchedAudio?.outputFormat ?? context.outputFormat
         let sampleRate = TalkTTSValidation.pcmSampleRate(from: playbackFormat)
         let result: StreamingPlaybackResult
@@ -1595,6 +1870,9 @@ final class TalkModeManager: NSObject {
             self.lastPlaybackWasPCM = false
             result = await self.mp3Player.play(stream: stream)
         }
+        let interruptedAt = result.interruptedAt.map { String(format: "%.3f", $0) } ?? "none"
+        GatewayDiagnostics.log(
+            "talk tts: incremental playback finished=\(result.finished) interruptedAt=\(interruptedAt) pcm=\(self.lastPlaybackWasPCM)")
         if !result.finished, let interruptedAt = result.interruptedAt {
             self.lastInterruptedAtSeconds = interruptedAt
         }
@@ -2016,40 +2294,24 @@ extension TalkModeManager {
 }
 
 private final class AudioTapDiagnostics: @unchecked Sendable {
-    private let label: String
     private let onLevel: (@Sendable (Float) -> Void)?
     private let lock = NSLock()
-    private var bufferCount: Int = 0
-    private var lastLoggedAt = Date.distantPast
     private var lastLevelEmitAt = Date.distantPast
-    private var maxRmsWindow: Float = 0
-    private var lastRms: Float = 0
 
     init(label: String, onLevel: (@Sendable (Float) -> Void)? = nil) {
-        self.label = label
+        _ = label
         self.onLevel = onLevel
     }
 
     func onBuffer(_ buffer: AVAudioPCMBuffer) {
-        var shouldLog = false
         var shouldEmitLevel = false
-        var count = 0
         lock.lock()
-        bufferCount += 1
-        count = bufferCount
         let now = Date()
-        if now.timeIntervalSince(lastLoggedAt) >= 1.0 {
-            lastLoggedAt = now
-            shouldLog = true
-        }
         if now.timeIntervalSince(lastLevelEmitAt) >= 0.12 {
             lastLevelEmitAt = now
             shouldEmitLevel = true
         }
         lock.unlock()
-
-        let rate = buffer.format.sampleRate
-        let ch = buffer.format.channelCount
         let frames = buffer.frameLength
 
         var rms: Float?
@@ -2066,20 +2328,9 @@ private final class AudioTapDiagnostics: @unchecked Sendable {
         }
 
         let resolvedRms = rms ?? 0
-        lock.lock()
-        lastRms = resolvedRms
-        if resolvedRms > maxRmsWindow { maxRmsWindow = resolvedRms }
-        let maxRms = maxRmsWindow
-        if shouldLog { maxRmsWindow = 0 }
-        lock.unlock()
-
         if shouldEmitLevel, let onLevel {
             onLevel(resolvedRms)
         }
-
-        guard shouldLog else { return }
-        GatewayDiagnostics.log(
-            "\(label) mic: buffers=\(count) frames=\(frames) rate=\(Int(rate))Hz ch=\(ch) rms=\(String(format: "%.4f", resolvedRms)) max=\(String(format: "%.4f", maxRms))")
     }
 }
 
